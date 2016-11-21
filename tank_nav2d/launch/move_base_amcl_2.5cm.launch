@@ -1,0 +1,5 @@
+<launch>
+  <node name="map_server" pkg="map_server" type="map_server" args="/home/exbot/map.yaml" respawn="false" />
+  <include file="$(find tank_nav2d)/move_base_config/amcl_node.xml"/>
+  <include file="$(find tank_nav2d)/move_base_config/move_base.xml"/>
+</launch>

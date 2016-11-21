@@ -1,0 +1,912 @@
+#include "kyheader.h"
+#include "Objectness.h"
+#include "ValStructVec.h"
+#include "CmShow.h"
+#include <cv.h>
+#include <highgui.h>
+#include <opencv2/objdetect/objdetect.hpp>
+#include "opencv2/imgproc/imgproc.hpp"
+#include <stdio.h>
+#include "detect.h"
+#include "ColorIdentify.h"
+#include "descriptor.h"
+#include "CompressiveTracker.h"
+//ROS boost related header
+#include <ros/ros.h>
+#include <boost/thread.hpp>
+#include <boost/thread/mutex.hpp>
+#include <image_transport/image_transport.h>
+#include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/image_encodings.h>
+#include <can_msg/gimbal.h>
+#include <can_msg/get_Distance.h>
+#include <can_msg/ask_for_frame.h>
+#include <can_msg/safety.h>
+
+//used to connect to ROS network
+int width = 800;
+int height = 448;
+/* Keep the webcam from locking up when you interrupt a frame capture */
+volatile int quit_signal=0;
+#ifdef __unix__
+#include <signal.h>
+void quit_signal_handler(int signum)
+{
+    if (quit_signal!=0) exit(0); // just exit already
+    quit_signal=1;
+    printf("Will quit at next camera frame (repeat to kill now)\n");
+}
+#endif
+
+typedef struct PID {
+float SetPoint; // □è□¨□□±êDesired value
+float Proportion; // ±□□□□□□□Proportional Const
+float Integral; // □□·□□□□□Integral Const
+float Derivative; // □□·□□□□□Derivative Const
+float CurrentError; // Error[0]
+float LastError; // Error[-1]
+float PrevError; // Error[-2]
+//float SumError; // Sums of Errors
+} PID;
+
+PID vPID_x = {0,2.4,1.0,0.8,0,0,0};
+PID vPID_y = {0,2,0.6,0.7,0,0,0};
+
+vector<Rect> RunObjectness(int numPerSz, CMat &image, Objectness objNess);
+float PIDCalc(PID *pp, float SetPoint,float NextPoint,int flag)
+{
+    float dError;
+    float Error;
+    float SumError;
+    if(flag=='x')
+        Error =  -(NextPoint - SetPoint)/width*2; // □□□□
+    else if(flag=='y')
+        Error =  (NextPoint - SetPoint)/height*2;
+    pp->PrevError = pp->LastError;
+    pp->LastError = pp->CurrentError;
+    pp->CurrentError = Error;
+    SumError = pp->CurrentError + pp->LastError + pp->PrevError;
+    dError = pp->CurrentError - pp->LastError; // □±□°□□·□
+    pp->PrevError = pp->LastError;
+    pp->LastError = Error;
+    float rk = pp->Proportion * pp->CurrentError + pp->Integral * SumError+ pp->Derivative * dError;
+    return rk;
+}
+void illutrateLoG()
+{
+    for (float delta = 0.5f; delta < 1.1f; delta+=0.1f){
+        Mat f = Objectness::aFilter(delta, 8);
+        normalize(f, f, 0, 1, NORM_MINMAX);
+        CmShow::showTinyMat(format("D=%g", delta), f);
+    }
+    waitKey(0);
+}
+
+Rect ChoseTrackingObject(vector<Rect> found_rect,Rect box_last)
+{
+    int area,distance,distance_temp,index;
+    area = 0;
+    float area_closest = 800*448,area_temp=1.0;
+    distance = 800+448;
+    float boxLast_area;
+//    if(box_last.x==0 && box_last.y==0 && box_last.width==0 && box_last.height==0)
+    {
+        for(int i=0;i<found_rect.size();i++)
+        {
+            area_temp = found_rect[i].width*found_rect[i].height;
+            if(area_temp>area)
+            {
+                index = i;
+                area = area_temp;
+            }
+        }
+        return found_rect[index];
+    }
+    boxLast_area = float(box_last.area());
+    for(int i=0;i<found_rect.size();i++)
+    {
+//        area_temp = fabs(found_rect[i].area()-box_last.area())/box_last.area();
+//        if(area_temp<area_closest)
+//        {
+//            index = i;
+//            area_closest = area_temp;
+//        }
+        area_temp = found_rect[i].width*found_rect[i].height;
+        if(area_temp>area)
+        {
+            index = i;
+            area = area_temp;
+        }
+//        distance_temp = abs(found_rect[i].x-box_last.x) + abs(found_rect[i].y-box_last.y);
+//        if(distance_temp<=distance)
+//        {
+//            index=i;
+//            distance = distance_temp;
+//        }
+    }
+    return found_rect[index];
+}
+Point2f CalculateAngular(Rect box,bool isFound)
+{
+    int x_center = width/2;
+    int y_center = height/2;
+    Point2f angular;
+    angular.x=0;
+    angular.y=0;
+    if(!isFound)
+    {
+        angular.x = 0;
+        angular.y = 0;
+        return angular;
+    }
+    int scaleNum = 6;
+    int x_scale[scaleNum],y_scale[scaleNum];
+    x_scale[0]=10;x_scale[1]=35;x_scale[2]=60;x_scale[3]=145;x_scale[4]=230;x_scale[5]=400;
+    y_scale[0]=5;y_scale[1]=20;y_scale[2]=50;y_scale[3]=90;y_scale[4]=150;y_scale[5]=224;
+    float box_x_rate = 0.5;
+    float box_y_rate = 0.5;
+    int x = box.x+int(box_x_rate*box.width)-x_center;
+    int y = box.y+int(box_y_rate*box.height)-y_center;
+    for(int i=0;i<scaleNum-1;i++)
+    {
+        if( x >= x_scale[i] && x < x_scale[i+1] )
+            angular.x = - ( i*2 + 2.7 );
+        if( x <= -x_scale[i] && x > -x_scale[i+1] )
+            angular.x = i*2 + 2.7;
+        if(y >= y_scale[i] && y < y_scale[i+1] )
+            angular.y = i*2 + 2.7;
+        if(y <= -y_scale[i] && y > -y_scale[i+1] )
+            angular.y = - ( i*2 + 2.7 );
+    }
+    return angular;
+    //    float scale_x = -0.6171914/(float)200;
+    //    float scale_y = -0.3780142/(float)112;
+    //    angular.x = scale_x * (box.x-400);
+    //    angular.y = scale_y * (box.y-224);
+    //    if(angular.x<=-30/57.3)
+    //        angular.x = -30/57.3;
+    //    if(angular.x>=30/57.3)
+    //        angular.x = 30/57.3;
+
+    //    if(angular.y<=-20/57.3)
+    //        angular.y = -20/57.3;
+    //    if(angular.y>=20/57.3)
+    //        angular.y = 20/57.3;
+}
+
+Point2f CalculateAngularPID(Rect box,bool isFound)
+{
+    float x_center = width/2;
+    float y_center = height/2;
+    Point2f angular;
+    angular.x=0;
+    angular.y=0;
+    if(!isFound)
+    {
+        angular.x = 0;
+        angular.y = 0;
+        return angular;
+    }/*
+    vPID_x.PrevError = vPID_x.LastError;
+    vPID_x.LastError = vPID_x.CurrentError;*/
+    float box_x_rate = 0.5;
+    float box_y_rate = 0.5;
+    float x_current = box.x+float(box_x_rate*box.width);
+    float y_current = box.y+float(box_y_rate*box.height);
+    printf("Y current:%f,X current:%f\r\n",x_current,y_current);
+    angular.x = PIDCalc(&vPID_x, x_center, x_current,'x');
+    angular.y = PIDCalc(&vPID_y, y_center, y_current,'y');
+    if(x_current - x_center<6 && x_current - x_center>-6)
+        angular.x = 0;
+    if(y_current - y_center<5 && y_current - y_center>-5)
+        angular.y = 0;
+    if (angular.x > 15)
+        angular.x =15;
+    if (angular.x < -15)
+        angular.x = -15;
+    if (angular.y > 15)
+        angular.y =15;
+    if (angular.y < -15)
+        angular.y = -15;
+    return angular;
+}
+
+
+Point2f CalculateAngularPIDMethod2(Rect box,bool isFound)
+{
+    float x_center = width/2;
+    float y_center = height/2;
+    Point2f angular;
+    angular.x=0;
+    angular.y=0;
+    if(!isFound)
+    {
+        angular.x = 0;
+        angular.y = 0;
+        return angular;
+    }/*
+    vPID_x.PrevError = vPID_x.LastError;
+    vPID_x.LastError = vPID_x.CurrentError;*/
+    float box_x_rate = 0.5;
+    float box_y_rate = 0.0;
+    float x_current = box.x+float(box_x_rate*box.width);
+    float y_current = box.y+float(box_y_rate*box.height);
+//    printf("X current:%f, Y current:%f\r\n",x_current,y_current);
+    angular.x = x_current - x_center;
+    angular.y = y_current - y_center;
+    if(x_current - x_center<6 && x_current - x_center>-6)
+        angular.x = 0;
+    if(y_current - y_center<5 && y_current - y_center>-5)
+        angular.y = 0;
+//    if (angular.x > 15)
+//        angular.x =15;
+//    if (angular.x < -15)
+//        angular.x = -15;
+//    if (angular.y > 15)
+//        angular.y =15;
+//    if (angular.y < -15)
+//        angular.y = -15;
+    return angular;
+}
+
+
+class io_method{
+private:
+    ros::NodeHandle nh_;
+    ros::Publisher gimbal_pub;
+    ros::ServiceClient laser_client;
+    ros::ServiceClient ask_frame;
+    ros::Publisher safety_pub;
+
+public:
+    io_method()
+    {
+        gimbal_pub = nh_.advertise<can_msg::gimbal>("cmd_gimbal", 1);
+        //laser_client = nh_.serviceClient<can_msg::get_Distance>("get_Distance");
+        ask_frame = nh_.serviceClient<can_msg::ask_for_frame>("ask_for_frame");
+        safety_pub = nh_.advertise<can_msg::safety>("safety", 1);
+    }
+
+    void pub_gimbal_cmd(can_msg::gimbal& cmd)
+    {
+        gimbal_pub.publish(cmd);
+    }
+
+    void pub_safety_cmd(can_msg::safety& cmd)
+    {
+        safety_pub.publish(cmd);
+    }
+
+    cv::Mat ask_for_frame()
+    {
+        Mat empty;
+        can_msg::ask_for_frame srv;
+        sensor_msgs::Image image_;
+        ask_frame.call(srv);
+        image_ =  srv.response.image ;
+        cv_bridge::CvImagePtr cv_ptr;
+        try
+        {
+            cv_ptr = cv_bridge::toCvCopy(srv.response.image,sensor_msgs::image_encodings::BGR8);
+        }
+        catch (cv_bridge::Exception& e){
+            ROS_ERROR("cv_bridge exception: %s", e.what());
+        }
+        return cv_ptr->image;
+    }
+
+//     call_laser_service(can_msg::get_DistanceRequest& request)
+//    {
+
+//        laser_client.call()
+//    }
+};
+////////////////////////////////////////////////////////////////////
+int main(int argc, char* argv[])
+{
+    //used to initalize the node in ROS
+    ros::init (argc,argv,"vision_node");
+#ifdef __unix__
+    signal(SIGINT,quit_signal_handler); // listen for ctrl-C
+    signal(SIGTSTP,quit_signal_handler);
+    signal(SIGTERM,quit_signal_handler);
+#endif
+
+    //Initialation
+    DataSetVOC voc2007("/home/exbot/Desktop/VOCdevkit/VOC2007/");
+    Objectness objNess(voc2007,2,8,2);
+    objNess.loadTrainedModel();
+    objNess.illustrate();
+
+    CompressiveTracker ct;
+    Mat last_gray;
+//    namedWindow("Vedio Window", CV_WINDOW_AUTOSIZE);
+    namedWindow("Detect Enemy", CV_WINDOW_AUTOSIZE);
+//    namedWindow("Image_found", CV_WINDOW_AUTOSIZE);
+//    moveWindow("Vedio Window",0,0);
+    moveWindow("Detect Enemy",400,100);
+//    moveWindow("Image_found",500,400);
+
+    detect DetectCar;
+    DetectCar.setColor('r');
+    DetectCar.setMethod(4);
+    DetectCar.setCenter(int(width/2),int(height/2));
+    DetectCar.setImgAttributes(int(width/2),int(height/2),width,height);
+    vector<float> detector = vector<float>(Descriptor, Descriptor + sizeof(Descriptor)/sizeof(Descriptor[0]));
+    DetectCar.setSVMDetector(detector);
+    vector<Vec4i> boxes;
+    double t;
+    vector<Point> found_position;
+    vector<Rect> found_rect;
+    vector<Point2f> found_angular;
+    vector<int> found_classifier;
+    Mat current_gray,frame;
+    vector<int> compression_params;
+    compression_params.push_back(CV_IMWRITE_PNG_COMPRESSION);
+    compression_params.push_back(9);
+    bool isTracking = false;
+    bool isFound = false;
+    bool isClear = true;
+    int isClearCounter = 0;
+    int isCarCounter = 0;
+    Rect box,box_last;  ///CAUTION: box&angular is the output
+    Point2f angular;    ///augular.x is yaw, angular.y is pitch
+    io_method io_service;
+    int count_flag = 0;
+    sleep (0.5);
+    int empty_count = 0;
+    while(ros::ok ())
+    {
+        t = (double)cvGetTickCount();
+        //used to get a newest frame from ROS
+        frame = io_service.ask_for_frame ();
+        if (frame.rows == 0 || frame.cols == 0)
+        {
+            if(quit_signal)     // exit cleanly on interrupt
+            {
+                angular.x = 999.0;
+                angular.y = 999.0;
+                can_msg::gimbal temp;
+                temp.yaw = angular.x;
+                temp.pitch = angular.y;
+                io_service.pub_gimbal_cmd (temp);
+//                ct.printHistory();
+                printf("I am shutting down!!\r\n");
+                exit(0);
+            }
+            continue;
+        }
+        if(!isTracking)
+        {
+            DetectCar.setImg(frame);
+            vector<Rect> bing_boxes;
+            bing_boxes.push_back(Rect_<int> (0,0,width,height));
+            DetectCar.ColordetectionBingBoxes(bing_boxes);
+            vector<Rect> FoundSuspectedCar = DetectCar.ColorFoundSuspectedCar();
+
+//            printf("STEP 1 OK!\n");
+
+//             Rect FoundSuspectedRegion = DetectCar.ColorFoundSuspectedRegion();
+//             printf("FoundSuspectedCar : %d  ",FoundSuspectedCar.size());
+
+
+            //************************************************************************************
+            // If there is no suspected car
+            //************************************************************************************
+               if (!FoundSuspectedCar.size())
+               {
+                   if (empty_count < 10 )
+                   {
+                       empty_count ++;
+                       angular.x = 0;
+                       angular.y = 0;
+                       box_last = Rect_<int>(0,0,0,0);
+                       can_msg::gimbal temp;
+                       temp.yaw = angular.x;
+                       temp.pitch = angular.y;
+                       io_service.pub_gimbal_cmd (temp);
+                       imshow("LOST FRAME",frame);
+                       FoundSuspectedCar.clear();
+                       cvWaitKey(DELTATIME);
+
+                       if(quit_signal)     // exit cleanly on interrupt
+                       {
+                           angular.x = 999.0;
+                           angular.y = 999.0;
+                           can_msg::gimbal temp;
+                           temp.yaw = angular.x;
+                           temp.pitch = angular.y;
+                           io_service.pub_gimbal_cmd (temp);
+//                           ct.printHistory();
+                           printf("I am shutting down!!\r\n");
+                           exit(0);
+                       }
+                       continue;
+                   }
+
+                   isFound = false;
+                   isClear = true;
+                   isClearCounter = 0;
+                   isCarCounter = 0;
+
+                   angular.x = 999.0;
+                   angular.y = 999.0;
+                   box_last = Rect_<int>(0,0,0,0);
+                   can_msg::gimbal temp;
+                   temp.yaw = angular.x;
+                   temp.pitch = angular.y;
+                   io_service.pub_gimbal_cmd (temp);
+                   printf("LOST!!!!\n");
+                   imshow("LOST FRAME",frame);
+                   FoundSuspectedCar.clear();
+                   cvWaitKey(DELTATIME);
+                   t = (double)cvGetTickCount() - t;
+                   t =  t/(cvGetTickFrequency()*1000);   //ms
+                   printf("Running time is: %lf\n",t);
+                   if(quit_signal)     // exit cleanly on interrupt
+                   {
+                       angular.x = 999.0;
+                       angular.y = 999.0;
+                       can_msg::gimbal temp;
+                       temp.yaw = angular.x;
+                       temp.pitch = angular.y;
+                       io_service.pub_gimbal_cmd (temp);
+//                       ct.printHistory();
+                       printf("I am shutting down!!\r\n");
+                       exit(0);
+                   }
+                   continue;
+//                   printf("Warning: there is suspected car!\n");
+               }
+
+//               printf("STEP 3 OK!\n");
+
+//               printf("I see something!!!!!!\n");
+               if(empty_count!=0)
+               {
+                   empty_count = 0;
+               }
+
+            //************************************************************************************
+            //             delete the small boxes encapsued by bigger boxes
+            //************************************************************************************
+            vector<Rect> color_bingboxes; // vector store the suspected boxes after deleted
+            for(int j=0;j<FoundSuspectedCar.size();j++)
+            {
+                Rect r = FoundSuspectedCar[j];
+                int k;
+                for(k=0;k<FoundSuspectedCar.size();k++)
+                {
+                    if(k!=j &&(r & FoundSuspectedCar[k])==r)
+                    {
+                        break;
+                        k++;
+                    }
+                }
+                if(k==FoundSuspectedCar.size())
+                {
+                        color_bingboxes.push_back(r);
+//                      printf("%d %d %d %d \r\n",bingboxes_temp[j].x,bingboxes_temp[j].y,bingboxes_temp[j].width,bingboxes_temp[j].height);
+                }
+            }
+
+//            printf("STEP 3.2 OK!\n");
+
+            //************************************************************************************
+            //       choose a box for tracking and then  using SVM + HOG
+            //************************************************************************************
+            if(color_bingboxes.size()!=0)
+            {
+
+//                printf("%d\n",box_last.width);
+                box = ChoseTrackingObject(color_bingboxes,box_last);
+//                printf("Control Value:x = %f,y = %f\r\n",angular.x,angular.y);
+
+//                /* Send control signal to the CAR BOARD */
+//                can_msg::gimbal temp;
+//                temp.yaw = angular.x;
+//                temp.pitch = angular.y;
+//                io_service.pub_gimbal_cmd (temp);
+//                printf("%d\n",box.width);
+
+                vector<Rect> ColorBox;
+                float center_x = (float)box.x  + (float)box.width/2;
+                float center_y = (float)box.y  + (float)box.height/2;
+                int expand_xmin = max(int(center_x - float(box.width)/2*3), 0);
+                int expand_ymin = max(int(center_y - float(box.height)/2*5), 0);
+                int expand_xmax = min(int(center_x + float(box.width)/2*3), width - 1);
+                int expand_ymax = min(int(center_y + float(box.height)/2*4), height - 1);
+//                printf("STEP 3.3 OK!\n");
+//                if ((expand_xmax - expand_xmin) >= 64 && (expand_xmax - expand_xmin) <= 800 && (expand_ymax - expand_ymin) >= 48 && (expand_ymax - expand_ymin) <= 448)
+                if ((expand_xmax - expand_xmin) >= 64 && (expand_ymax - expand_ymin) >= 48)
+                {
+                    ColorBox.push_back(Rect_<int> (expand_xmin, expand_ymin, expand_xmax - expand_xmin, expand_ymax - expand_ymin));
+
+//                    printf("STEP 3.4 OK!\n");
+
+//                    DetectCar.detectCar(ColorBox);
+                    DetectCar.detectCarForColor(ColorBox);
+                    found_rect = DetectCar.getTargetRect();
+//                    printf("STEP 3.5 OK!\n");
+                    if(found_rect.size()!=0)
+                    {
+                        isFound = true;
+                        isCarCounter++;
+                        if(isCarCounter>1)
+                        {
+                            isClear = false;
+                        }
+                    }
+                    else
+                    {
+                        isClearCounter++;
+                        isClear = true;
+                    }
+                }
+                else
+                {
+                    isClear = true;
+                }
+
+//                printf("STEP 4 OK!\n");
+                /*************************************************************************/
+                /***              Caculation of angular                              *****/
+                /*************************************************************************/
+        //        angular = CalculateAngular(box,isFound);
+        //        angular = CalculateAngularPID(box,isFound);
+                angular = CalculateAngularPIDMethod2(box,isFound);
+                if (isFound)
+                {
+                    printf("%d\n",isCarCounter);
+                    rectangle(frame,box,Scalar(0, 255, 0),1);
+                    box_last = box;
+                }
+                else
+                {
+                    rectangle(frame,box,Scalar(255, 255, 255),1);
+                    box_last = Rect_<int>(0,0,0,0);
+
+                }
+                isFound = false;  // release isFound back
+//                printf("vPID_x:CurrentError=%f,LastError=%f,PrevError=%f\r\n",vPID_x.CurrentError,vPID_x.LastError,vPID_x.PrevError);
+//                printf("vPID_y:CurrentError=%f,LastError=%f,PrevError=%f\r\n",vPID_y.CurrentError,vPID_y.LastError,vPID_y.PrevError);
+
+                printf("Control Value:x = %f,y = %f\r\n",angular.x,angular.y);
+//                can_msg::gimbal temp;
+//                temp.yaw = angular.x;
+//                temp.pitch = angular.y;
+//                io_service.pub_gimbal_cmd (temp);
+//                printf("ANGULAR:%f\n-----------------",angular.x);
+                /*************************************************************************/
+                /***              Clear vectors                                      *****/
+                /*************************************************************************/
+                boxes.clear();
+                bing_boxes.clear();
+                color_bingboxes.clear();
+                FoundSuspectedCar.clear();
+
+                if(isClear)
+                {
+
+                    /* Send control signal to the CAR BOARD */
+                    can_msg::safety safety_;
+                    safety_.safe = !isClear;
+                    io_service.pub_safety_cmd(safety_);
+                    angular.x = 0;
+                    angular.y = 0;
+                    can_msg::gimbal temp;
+                    temp.yaw = angular.x;
+                    temp.pitch = angular.y;
+                    io_service.pub_gimbal_cmd (temp);
+
+                    imshow("Detect Enemy",frame);
+//                    printf("Is NOT Enemy!!\r\n");
+                    if(quit_signal)     // exit cleanly on interrupt
+                    {
+                        angular.x = 999.0;
+                        angular.y = 999.0;
+                        can_msg::gimbal temp;
+                        temp.yaw = angular.x;
+                        temp.pitch = angular.y;
+                        io_service.pub_gimbal_cmd (temp);
+//                        ct.printHistory();
+                        printf("I am shutting down!!\r\n");
+                        exit(0);
+                    }
+                    cvWaitKey(DELTATIME);
+                    continue;
+                }
+                else
+                {
+                    can_msg::safety safety_;
+                    if(isClearCounter!=0)
+                    {
+                        if(float(isCarCounter)/float(isClearCounter)>=0)
+                        {
+                            safety_.safe = true;
+                            isClear = false;
+                            printf("Is Enemy!!------------------------\r\n");
+                            rectangle(frame,box,Scalar(0, 0, 255),1);
+                        }
+                        else
+                        {
+                            safety_.safe = false;
+                            isClear = true;
+                        }
+                    }
+                    else
+                    {
+                        safety_.safe = true;
+                        isClear = false;
+                        printf("Is Enemy!!------------------------\r\n");
+                        rectangle(frame,box,Scalar(0, 0, 255),1);
+                    }
+
+                    /* Send control signal to the CAR BOARD */
+//                    safety_.safe = !isClear;
+                    io_service.pub_safety_cmd(safety_);
+
+                    can_msg::gimbal temp;
+                    temp.yaw = angular.x;
+                    temp.pitch = angular.y;
+                    io_service.pub_gimbal_cmd (temp);
+
+//                    isClear = true;
+                    isClearCounter = 0;
+                    isCarCounter = 0;
+                }
+
+//                printf("STEP 5 OK!\n");
+                imshow("Detect Enemy",frame);
+
+                cvWaitKey(DELTATIME);
+                if(quit_signal)     // exit cleanly on interrupt
+                {
+                    angular.x = 999.0;
+                    angular.y = 999.0;
+                    can_msg::gimbal temp;
+                    temp.yaw = angular.x;
+                    temp.pitch = angular.y;
+                    io_service.pub_gimbal_cmd (temp);
+                    ct.printHistory();
+                    exit(0);
+                }
+            }
+            else
+            {
+                angular.x = 0;
+                angular.y = 0;
+                can_msg::gimbal temp;
+                temp.yaw = angular.x;
+                temp.pitch = angular.y;
+                io_service.pub_gimbal_cmd (temp);
+//                vPID_x.CurrentError=0; vPID_x.LastError=0; vPID_x.PrevError=0;
+//                vPID_y.CurrentError=0; vPID_y.LastError=0; vPID_y.PrevError=0;
+                isFound = false;
+            }
+
+//            count_flag ++;
+//            for (int k = 0; k < bing_boxes.size(); k++)
+//                printf("%d %d %d %d \r\n",bing_boxes[k].x,bing_boxes[k].y,bing_boxes[k].width,bing_boxes[k].height);
+//            t = (double)cvGetTickCount();
+//            DetectCar.detectCar(color_bingboxes);
+//            t = (double)cvGetTickCount() - t;
+//            t =  t/(cvGetTickFrequency()*1000);   //ms
+//            printf("Runing Time is: %f\r\n",t);
+//            found_rect = DetectCar.getTargetRect();
+//            if(found_rect.size()!=0)
+//            {            boxes.clear();
+
+
+//                for(int i=0;i<found_rect.size();i++)
+//                {
+//                    Rect r = found_rect[i];
+//                    rectangle(frame, r.tl(), r.br(), Scalar(255, 0, 0), 3);
+//                }
+//                box = ChoseTrackingObject(found_rect,box_last);
+//                cvtColor(frame, last_gray, CV_RGB2GRAY);
+//                ct.init(last_gray, box);
+//                isTracking = true;
+//                isFound = true;
+//            }
+//            else
+//            {
+//                can_msg::gimbal temp;
+//                temp.yaw = 0;
+//                temp.pitch = 0;
+//                io_service.pub_gimbal_cmd (temp);
+//                vPID_x.CurrentError=0; vPID_x.LastError=0; vPID_x.PrevError=0;
+//                vPID_y.CurrentError=0; vPID_y.LastError=0; vPID_y.PrevError=0;
+//                isFound = false;
+//            }
+        }
+
+        /*************************************************************************/
+        /***              CT Tracking                                        *****/
+        /*************************************************************************/
+        else
+        {
+            t = (float)cvGetTickCount();
+            cvtColor(frame, current_gray, CV_RGB2GRAY);
+            ct.processFrame(current_gray, box);
+            t = cvGetTickCount() - t;
+//            printf("radioMax is:%f  ,  Running Time is:%f ms\r\n\r\n",ct.getRadioMax(),t/(cvGetTickFrequency()*1000));
+            if(!ct.isTracking())
+            {
+//                can_msg::gimbal temp;
+//                temp.yaw = 0;
+//                temp.pitch = 0;
+//                io_service.pub_gimbal_cmd (temp);
+                printf("WARNING: Object Is Lost!!\r\n");
+//                vPID_x.PrevError = vPID_x.LastError;
+//                vPID_x.LastError = vPID_x.CurrentError;
+//                vPID_x.CurrentError = 0;
+//                vPID_y.PrevError = vPID_y.LastError;
+//                vPID_y.LastError = vPID_y.CurrentError;
+//                vPID_y.CurrentError = 0;
+                vPID_x.CurrentError=0; vPID_x.LastError=0; vPID_x.PrevError=0;
+                vPID_y.CurrentError=0; vPID_y.LastError=0; vPID_y.PrevError=0;
+                isTracking = false;
+                isFound = false;
+                ct.printHistory();
+                if(quit_signal)     // exit cleanly on interrupt
+                {
+                    angular.x = 999.0;
+                    angular.y = 999.0;
+                    can_msg::gimbal temp;
+                    temp.yaw = angular.x;
+                    temp.pitch = angular.y;
+                    io_service.pub_gimbal_cmd (temp);
+//                    ct.printHistory();
+                    printf("I am shutting down!!\r\n");
+                    exit(0);
+                }
+                continue;
+            }
+            rectangle(frame, box, Scalar(255,0,0));
+//            imshow("Vedio Window", frame);
+//            printf("Current Tracking Box = x:%d y:%d h:%d w:%d\r\n", box.x, box.y, box.width, box.height);
+        } //END of CT
+
+//        printf("STEP 2 OK!\n");
+        if(quit_signal)     // exit cleanly on interrupt
+        {
+            angular.x = 999.0;
+            angular.y = 999.0;
+            can_msg::gimbal temp;
+            temp.yaw = angular.x;
+            temp.pitch = angular.y;
+            io_service.pub_gimbal_cmd (temp);
+//            ct.printHistory();
+            printf("I am shutting down!!\r\n");
+            exit(0);
+        }
+
+    } //END of while(frame)
+
+    int key = waitKey();
+    if(key>0)
+        return 0;
+}
+
+vector<Rect> RunObjectness(int numPerSz, CMat &image, Objectness objNess)
+{
+    srand((unsigned int)time(NULL));
+    //DataSetVOC voc2007("/home/bittnt/BING/BING_beta1/VOC/VOC2007/");
+
+
+//    DataSetVOC voc2007("/home/exbot/Desktop/VOCdevkit/VOC2007/");
+//    Objectness objNess(voc2007, base, W, NSS);
+
+//    objNess.loadTrainedModel();
+//    objNess.illustrate();
+
+    //voc2007.loadAnnotations();
+    //voc2007.loadDataGenericOverCls();
+
+    //printf("Dataset:`%s' with %d training and %d testing\n", _S(voc2007.wkDir), voc2007.trainNum, voc2007.testNum);
+    //printf("%s Base = %g, W = %d, NSS = %d, perSz = %d\n", _S(resName), base, W, NSS, numPerSz);
+
+     vector<vector<Vec4i>> boxesTests;
+     objNess.getObjBndBoxesForTestsFast(image, boxesTests, numPerSz);
+    //objNess.getObjBndBoxesForTests(boxesTests, 250);
+    //objNess.getObjBndBoxesForTestsFast(boxesTests, numPerSz);
+    //objNess.getRandomBoxes(boxesTests);
+
+//        printf("%d",boxes.size());
+//        for (int k = 0; k < boxes.size(); k++)
+//            printf("%s\n",_S(objNess.strVec4i(boxes[k])));
+
+    printf("BING finished!!!!\n");
+
+    //objNess.evaluatePerClassRecall(boxesTests, resName, 1000);
+    //objNess.illuTestReults(boxesTests);
+    //objNess.evaluatePAMI12();
+    //objNess.evaluateIJCV13();
+
+
+    vector<Vec4i> boxes = boxesTests[0];
+
+    for (int k = 0; k < boxes.size(); k++)
+        printf("%s\n",_S(format("%d, %d, %d, %d", boxes[k][0], boxes[k][1], boxes[k][2], boxes[k][3])));
+
+    // Find overlap boxes
+//    vector<Rect> bing_boxes;
+
+    vector<int> tobedelete_boxes;
+    for(int k=0; k<boxes.size(); k++)
+    {
+        if (boxes[k][2]-boxes[k][0]<wnd_size_width || boxes[k][3]-boxes[k][1]<wnd_size_height)
+        {
+            tobedelete_boxes.push_back(k);
+            continue;
+        }
+        int Width_1 = boxes[k][2]-boxes[k][0];
+        int Height_1 = boxes[k][3]-boxes[k][1];
+
+        for (int j=0;j<boxes.size();j++)
+        {
+            int Width_2 = boxes[j][2]-boxes[j][0];
+            int Height_2 = boxes[j][3]-boxes[j][1];
+
+            if (k == j)
+                 continue;
+            if ((Width_1*Height_1) > (Width_2*Height_2))
+                 continue;
+
+//            printf("///   k = %d   j = %d   ////\n",k,j);
+            if ((boxes[k][2]-boxes[j][0]) > 0 && (boxes[k][0]-boxes[j][2]) < 0 && (boxes[k][3]-boxes[j][1])>0 && (boxes[k][1]-boxes[j][3]) < 0 )
+            {
+                printf("///   k = %d   j = %d   ////",k,j);
+                int overlap_xmin = max(boxes[k][0],boxes[j][0]);
+                int overlap_xmax = min(boxes[k][2],boxes[j][2]);
+                int overlap_ymin = max(boxes[k][1],boxes[j][1]);
+                int overlap_ymax = min(boxes[k][3],boxes[j][3]);
+                printf("overlap: %d  %d  %d  %d\n",overlap_xmin,overlap_xmax,overlap_ymin,overlap_ymax);
+                int overlap_area = ( overlap_xmax - overlap_xmin ) * ( overlap_ymax - overlap_ymin );
+
+//                printf("///   k = %d   j = %d   ////",k,j);
+//                printf("%d %d--\n",Width_1*Height_1 , Width_2*Height_2);
+                printf("~~~~~~~~~~~~~~~~~ %d \n",(float(overlap_area) / float(Width_1*Height_1)) > 0.8);
+                printf("overlap_area: %d\n",overlap_area);
+
+                if ( (float(overlap_area) / float(Width_1*Height_1)) > 0.8)
+                {
+                        tobedelete_boxes.push_back(k);
+
+//                        printf("overlap: %d  %d  %d  %d\n",overlap_xmin,overlap_xmax,overlap_ymin,overlap_ymax);
+//                        Rect temp = Rect_<int> (overlap_xmin,overlap_ymin,overlap_xmax-overlap_xmin,overlap_ymax-overlap_ymin);
+//                        bing_boxes.push_back(temp);
+
+//                        printf("///   k = %d   j = %d   ////",k,j);
+                        break;
+                }
+//                if ((Width_1*Height_1) >=  (Width_2*Height_2))
+//                    if ( overlap_area / (Width_2*Height_2) > 0.9)
+//                    {
+//                        tobedelete_boxes.push_back(j);
+//                        break;
+//                    }
+            }
+        }
+    }
+
+    // delete overlap boxes
+    for ( int j=0; j<tobedelete_boxes.size(); j++ )
+    {
+//        printf("%d %d\n",tobedelete_boxes[j], boxes.size());
+        boxes.erase(boxes.begin() + ( tobedelete_boxes[j] - j));
+    }
+
+    // generate boxes for SVM + HOG (Li Haoyu)
+    vector<Rect> bing_boxes;
+    for( int k=0; k<boxes.size(); k++ )
+    {
+//        printf("%d %d\n",boxes.size(),k);
+        Rect temp = Rect_<int> (boxes[k][0],boxes[k][1],boxes[k][2]-boxes[k][0],boxes[k][3]-boxes[k][1]);
+        bing_boxes.push_back(temp);
+    }
+
+
+    return bing_boxes;
+}

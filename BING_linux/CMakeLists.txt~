@@ -1,0 +1,40 @@
+project(BING_linux)
+cmake_minimum_required(VERSION 2.8)
+
+find_package(OpenMP REQUIRED)
+find_package(catkin REQUIRED)
+find_package(catkin REQUIRED COMPONENTS
+  cv_bridge
+  image_transport
+  roscpp
+  sensor_msgs
+  std_msgs
+  can_msg
+)
+catkin_package(
+#  INCLUDE_DIRS include
+  LIBRARIES OpenCV_ROS_tutorial
+  CATKIN_DEPENDS cv_bridge image_transport roscpp sensor_msgs std_msgs
+  DEPENDS system_lib
+)
+
+add_library(LIBLINEAR src/LibLinear/linear.cpp src/LibLinear/linear.h src/LibLinear/train.c src/LibLinear/tron.cpp src/LibLinear/tron.h)
+add_library(BLAS src/LibLinear/blas/blas.h src/LibLinear/blas/blasp.h src/LibLinear/blas/daxpy.c src/LibLinear/blas/ddot.c src/LibLinear/blas/dnrm2.c src/LibLinear/blas/dscal.c)
+
+
+##if this does not work, then try to uncomment the things below.
+find_package( OpenCV REQUIRED )
+##if(OpenCV_FOUND)
+include_directories( ${OpenCV_INCLUDE_DIRS} ${catkin_INCLUDE_DIRS})
+##endif( OpenCV_FOUND )
+list( APPEND CMAKE_CXX_FLAGS "-std=c++0x ${CMAKE_CXX_FLAGS} -fopenmp -ftree-vectorize")
+#list( APPEND CMAKE_CXX_FLAGS "-std=c++0x ${CMAKE_CXX_FLAGS} -fopenmp -ftest-coverage -fprofile-arcs")
+
+add_executable(${PROJECT_NAME} src/main.cpp src/CmShow.h src/CmShow.cpp src/kyheader.h src/kyheader.cpp src/CmFile.h src/CmFile.cpp src/CmTimer.h
+src/FilterTIG.h src/FilterTIG.cpp src/DataSetVOC.cpp src/DataSetVOC.h src/ImgContrastBB.h src/Objectness.cpp src/Objectness.h src/ValStructVec.h
+src/LibLinear/linear.h src/LibLinear/linear.cpp src/LibLinear/tron.h src/LibLinear/tron.cpp src/LibLinear/blas/blas.h src/LibLinear/blas/blasp.h
+src/LibLinear/blas/daxpy.c src/LibLinear/blas/ddot.c src/LibLinear/blas/dnrm2.c src/LibLinear/blas/dscal.c  src/detect.cpp
+src/ColorIdentify.cpp src/descriptor.h src/CompressiveTracker.cpp)
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -Wall")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Wall")
+target_link_libraries(BING_linux ${OpenCV_LIBS} ${EXTERNAL_LIBS}${catkin_LIBRARIES})

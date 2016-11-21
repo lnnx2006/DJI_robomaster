@@ -1,0 +1,12 @@
+<launch>
+<group ns="tank102">
+<!--<include file="/home/exbot/catkin_ws/src/multimaster_fkie-hydro-devel/master_discovery_fkie/launch/master_discovery.launch" />-->
+<include file="$(find rplidar_ros)/launch/rplidar.launch" />
+<include file="/home/exbot/catkin_ws/src/Final_SLDASM_001/launch/display.launch" />
+<include file="$(find laser_filters)/examples/multi_filter_temp.launch" />
+<node pkg="XM_SerialNode" type="serialNode" name="serialNode" />
+<node pkg="raw2ROS_Node" type="raw2ROS_Node.py" name="raw2ROS_node">
+</node>
+<include file="/home/exbot/catkin_ws/src/tank_nav2d/launch/move_base_amcl_2.5cm.launch" />
+</group>
+</launch>

@@ -1,0 +1,6 @@
+<launch>
+  <node name="image_converter"  pkg="OpenCV_ROS_tutorial"  type="image_converter" output="screen">
+  </node>
+<node pkg="BING_linux" type="BING_linux" name="BING_linux" output="screen"/>
+<!--<node pkg="open_fire" type="" name="" >-->
+</launch>

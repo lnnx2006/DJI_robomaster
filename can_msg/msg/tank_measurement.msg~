@@ -1,0 +1,4 @@
+Header header
+byte tank_id
+geometry_msgs/Point pos
+bool inializing

@@ -1,0 +1,4 @@
+#include <cv.h>
+#include <CompressiveTracker.h>
+using namespace cv;
+using namespace std;
